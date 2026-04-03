@@ -110,6 +110,30 @@ def get_parser() -> argparse.ArgumentParser:
     parser.add_argument("--position_temperature", type=float, default=5.0)
     parser.add_argument("--class_temperature", type=float, default=0.0)
     parser.add_argument(
+        "--early_termination",
+        type=str2bool,
+        default=False,
+        help="Stop generation for converged samples early.",
+    )
+    parser.add_argument(
+        "--use_credit_decoding",
+        type=str2bool,
+        default=False,
+        help="Use credit decoding to commit stable tokens earlier.",
+    )
+    parser.add_argument(
+        "--use_torch_compile",
+        type=str2bool,
+        default=False,
+        help="Use torch.compile for faster forward pass.",
+    )
+    parser.add_argument(
+        "--fast_mode",
+        type=str2bool,
+        default=False,
+        help="Enable all optimizations and halve num_step.",
+    )
+    parser.add_argument(
         "--device",
         type=str,
         default=None,
@@ -147,6 +171,10 @@ def main():
         layer_penalty_factor=args.layer_penalty_factor,
         position_temperature=args.position_temperature,
         class_temperature=args.class_temperature,
+        early_termination=args.early_termination,
+        use_credit_decoding=args.use_credit_decoding,
+        use_torch_compile=args.use_torch_compile,
+        fast_mode=args.fast_mode,
     )
 
     torchaudio.save(args.output, audios[0], model.sampling_rate)

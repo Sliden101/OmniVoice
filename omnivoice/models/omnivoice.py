@@ -100,6 +100,20 @@ class OmniVoiceGenerationConfig:
     postprocess_output: bool = True
     audio_chunk_duration: float = 15.0
     audio_chunk_threshold: float = 30.0
+    early_termination: bool = False
+    use_credit_decoding: bool = False
+    credit_beta: float = 0.9
+    credit_gamma: float = 0.5
+    credit_alpha: float = 1.0
+    use_torch_compile: bool = False
+    fast_mode: bool = False
+
+    def __post_init__(self):
+        if self.fast_mode:
+            self.num_step = max(1, self.num_step // 2)
+            self.early_termination = True
+            self.use_credit_decoding = True
+            self.use_torch_compile = True
 
     @classmethod
     def from_dict(cls, kwargs_dict):
@@ -225,6 +239,7 @@ class OmniVoice(PreTrainedModel):
         self.duration_estimator = None
         self.sampling_rate = None
         self._asr_pipe = None
+        self._compiled_forward = None
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, *args, **kwargs):
@@ -569,16 +584,27 @@ class OmniVoice(PreTrainedModel):
             for idx, res in zip(long_idx, long_results):
                 results[idx] = res
 
-        generated_audios = []
+        all_tokens = []
+        all_rms = []
         for i in range(full_task.batch_size):
             assert results[i] is not None, f"Result {i} was not generated"
-            generated_audios.append(
-                self._decode_and_post_process(
-                    results[i], full_task.ref_rms[i], gen_config  # type: ignore[arg-type]
-                )
-            )
+            all_tokens.append(results[i])
+            all_rms.append(full_task.ref_rms[i])
+
+        generated_audios = self._decode_batch(all_tokens, all_rms, gen_config)
 
         return generated_audios
+
+    @property
+    def compiled_forward(self):
+        """Lazily compiled forward pass for inference optimization."""
+        if self._compiled_forward is None:
+            self._compiled_forward = torch.compile(
+                self.forward,
+                mode="reduce-overhead",
+                fullgraph=False,
+            )
+        return self._compiled_forward
 
     def create_voice_clone_prompt(
         self,
@@ -1146,7 +1172,7 @@ class OmniVoice(PreTrainedModel):
 
         c_lens = [inp["input_ids"].size(2) for inp in inputs_list]
         max_c_len = max(c_lens)
-        pad_id = self.config.audio_mask_id  # Or any other tokens
+        pad_id = self.config.audio_mask_id
 
         batch_input_ids = torch.full(
             (2 * B, self.config.num_audio_codebook, max_c_len),
@@ -1212,14 +1238,35 @@ class OmniVoice(PreTrainedModel):
             self.config.num_audio_codebook, device=self.device
         ).view(1, -1, 1)
 
+        # --- Optimization: Early termination tracking ---
+        converged = [False] * B
+        prev_tokens = [
+            tokens[i : i + 1, :, : task.target_lens[i]].clone() for i in range(B)
+        ]
+        unchanged_count = [0] * B
+
+        # --- Optimization: Credit decoding state ---
+        credit = torch.zeros(
+            (B, self.config.num_audio_codebook, max(task.target_lens)),
+            dtype=torch.float32,
+            device=self.device,
+        )
+
+        # --- Optimization: torch.compile ---
+        forward_fn = self.compiled_forward if gen_config.use_torch_compile else self
+
         for step in range(gen_config.num_step):
-            batch_logits = self(
+            batch_logits = forward_fn(
                 input_ids=batch_input_ids,
                 audio_mask=batch_audio_mask,
                 attention_mask=batch_attention_mask,
             ).logits.to(torch.float32)
 
             for i in range(B):
+                # --- Optimization: skip converged samples ---
+                if converged[i]:
+                    continue
+
                 k = schedules[i][step]
                 if k <= 0:
                     continue
@@ -1234,6 +1281,21 @@ class OmniVoice(PreTrainedModel):
                 pred_tokens, scores = self._predict_tokens_with_scoring(
                     c_logits, u_logits, gen_config
                 )
+
+                # --- Optimization: Credit Decoding ---
+                if gen_config.use_credit_decoding:
+                    c_log_probs = F.log_softmax(c_logits, dim=-1)
+                    top_token_mask = torch.zeros_like(c_log_probs)
+                    top_token_mask.scatter_(-1, pred_tokens.unsqueeze(-1), 1.0)
+                    top_log_prob = (c_log_probs * top_token_mask).sum(dim=-1)
+
+                    credit[i : i + 1] = gen_config.credit_beta * credit[i : i + 1] + (
+                        torch.clamp(top_log_prob, min=-10.0).abs() ** gen_config.credit_gamma
+                    )
+
+                    scores = self._apply_credit_decoding(
+                        scores, credit[i : i + 1], gen_config
+                    )
 
                 scores = scores - (layer_ids * gen_config.layer_penalty_factor)
 
@@ -1254,6 +1316,24 @@ class OmniVoice(PreTrainedModel):
                 tokens[i : i + 1, :, :t_len] = sample_tokens
                 batch_input_ids[i : i + 1, :, c_len - t_len : c_len] = sample_tokens
                 batch_input_ids[B + i : B + i + 1, :, :t_len] = sample_tokens
+
+            # --- Optimization: Early Termination ---
+            if gen_config.early_termination:
+                all_done = True
+                for i in range(B):
+                    if converged[i]:
+                        continue
+                    all_done = False
+                    current_tokens = tokens[i : i + 1, :, : task.target_lens[i]]
+                    if torch.equal(current_tokens, prev_tokens[i]):
+                        unchanged_count[i] += 1
+                    else:
+                        unchanged_count[i] = 0
+                        prev_tokens[i] = current_tokens.clone()
+                    if unchanged_count[i] >= 2:
+                        converged[i] = True
+                if all_done:
+                    break
 
         return [tokens[i, :, : task.target_lens[i]] for i in range(B)]
 
@@ -1281,6 +1361,71 @@ class OmniVoice(PreTrainedModel):
         confidence_scores = log_probs.max(dim=-1)[0]
 
         return pred_tokens, confidence_scores
+
+    def _apply_credit_decoding(
+        self,
+        scores: torch.Tensor,
+        credit: torch.Tensor,
+        gen_config: OmniVoiceGenerationConfig,
+    ) -> torch.Tensor:
+        """Fuse accumulated credit scores into position selection scores.
+
+        Args:
+            scores: Position selection scores, shape (1, C, T).
+            credit: Accumulated credit, shape (1, C, T).
+            gen_config: Generation config.
+        Returns:
+            Updated scores with credit fused in.
+        """
+        credit_boost = gen_config.credit_alpha * torch.log1p(credit)
+        return scores + credit_boost
+
+    def _decode_batch(
+        self,
+        tokens_list: List[torch.Tensor],
+        rms_list: List[Optional[float]],
+        gen_config: OmniVoiceGenerationConfig,
+    ) -> List[torch.Tensor]:
+        """Decode multiple token tensors in a single batched call.
+
+        Args:
+            tokens_list: List of audio token tensors, each shape (C, T_i).
+            rms_list: List of RMS values for volume normalization.
+            gen_config: Generation config.
+        Returns:
+            List of decoded audio tensors, each shape (1, T).
+        """
+        tokenizer_device = self.audio_tokenizer.device
+
+        max_len = max(t.size(-1) for t in tokens_list)
+        padded = []
+        for t in tokens_list:
+            pad_len = max_len - t.size(-1)
+            if pad_len > 0:
+                t_padded = F.pad(t, (0, pad_len), value=self.config.audio_mask_id)
+            else:
+                t_padded = t
+            padded.append(t_padded)
+
+        batch_tokens = torch.stack(padded, dim=0).to(tokenizer_device)
+
+        decoded = self.audio_tokenizer.decode(batch_tokens)
+        audio_values = decoded.audio_values
+
+        results = []
+        for i in range(len(tokens_list)):
+            orig_len = tokens_list[i].size(-1)
+            hop = self.audio_tokenizer.config.hop_length
+            wav_len = orig_len * hop
+            audio = audio_values[i, :, :wav_len].cpu()
+            results.append(
+                self._post_process_audio(
+                    audio,
+                    postprocess_output=gen_config.postprocess_output,
+                    ref_rms=rms_list[i],
+                )
+            )
+        return results
 
 
 # ---------------------------------------------------------------------------

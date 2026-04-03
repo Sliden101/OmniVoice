@@ -197,6 +197,30 @@ def get_parser():
         "language_id/language_name fields. If provided, both language_id and "
         "language_name will be set to this value.",
     )
+    parser.add_argument(
+        "--early_termination",
+        type=str2bool,
+        default=False,
+        help="Stop generation for converged samples early.",
+    )
+    parser.add_argument(
+        "--use_credit_decoding",
+        type=str2bool,
+        default=False,
+        help="Use credit decoding to commit stable tokens earlier.",
+    )
+    parser.add_argument(
+        "--use_torch_compile",
+        type=str2bool,
+        default=False,
+        help="Use torch.compile for faster forward pass.",
+    )
+    parser.add_argument(
+        "--fast_mode",
+        type=str2bool,
+        default=False,
+        help="Enable all optimizations and halve num_step.",
+    )
     return parser
 
 
