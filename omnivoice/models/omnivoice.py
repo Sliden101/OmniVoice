@@ -108,6 +108,10 @@ class OmniVoiceGenerationConfig:
     use_torch_compile: bool = False
     fast_mode: bool = False
     ultra_mode: bool = False
+    use_kv_cache: bool = False
+    kv_external_window: int = 128
+    kv_internal_window: int = 16
+    kv_refresh_cycle: int = 4
 
     def __post_init__(self):
         if self.ultra_mode:
@@ -117,6 +121,7 @@ class OmniVoiceGenerationConfig:
             self.use_torch_compile = True
             self.credit_alpha = 2.0
             self.credit_beta = 0.95
+            self.use_kv_cache = True
         elif self.fast_mode:
             self.num_step = max(1, self.num_step // 2)
             self.early_termination = True
@@ -124,17 +129,100 @@ class OmniVoiceGenerationConfig:
             self.use_torch_compile = True
             self.credit_alpha = 2.0
             self.credit_beta = 0.95
-        elif self.fast_mode:
-            self.num_step = max(1, self.num_step // 2)
-            self.early_termination = True
-            self.use_credit_decoding = True
-            self.use_torch_compile = True
 
     @classmethod
     def from_dict(cls, kwargs_dict):
         valid_keys = {f.name for f in fields(cls)}
         filtered = {k: v for k, v in kwargs_dict.items() if k in valid_keys}
         return cls(**filtered)
+
+
+class DiffusionKVCache:
+    """Manages KV cache for diffusion language model inference.
+
+    Adapts Window-Diffusion (arxiv.org/abs/2601.20332) for OmniVoice's
+    bidirectional attention architecture. Uses phase-level refresh:
+    full forward pass every N steps, KV reuse in between.
+
+    Token roles per step:
+    - PREFIX: style prompt + text tokens + ref audio (never changes, always cached)
+    - DECODED: tokens that have been committed (stable, cached with refresh)
+    - ACTIVE: tokens being decoded this step (full computation)
+    - BUFFER: undecoded tokens in external window (KV reused, not recomputed)
+    - FAR-FIELD: undecoded tokens outside window (pruned entirely)
+    """
+
+    def __init__(
+        self,
+        prefix_len: int,
+        max_seq_len: int,
+        batch_size: int,
+        device: torch.device,
+        external_window: int = 128,
+        internal_window: int = 16,
+        refresh_cycle: int = 4,
+    ):
+        self.prefix_len = prefix_len
+        self.max_seq_len = max_seq_len
+        self.batch_size = batch_size
+        self.device = device
+        self.external_window = external_window
+        self.internal_window = internal_window
+        self.refresh_cycle = refresh_cycle
+        self.step_count = 0
+        self.kv_cache = None
+
+    @property
+    def is_refresh_step(self) -> bool:
+        return self.step_count % self.refresh_cycle == 0
+
+    def step(self):
+        self.step_count += 1
+
+    def update_cache(self, past_key_values):
+        """Store KV cache from a refresh step."""
+        self.kv_cache = past_key_values
+
+    def get_computation_window(
+        self,
+        total_target_len: int,
+        num_masked: int,
+    ) -> tuple[int, int, int]:
+        """Return (prefix_len, active_start, active_end) for the current step.
+
+        On refresh steps: return full sequence (prefix + all target).
+        On normal steps: return prefix + first `internal_window` masked positions.
+        """
+        if self.is_refresh_step:
+            return self.prefix_len, self.prefix_len, self.prefix_len + total_target_len
+
+        active_count = min(num_masked, self.internal_window)
+        return self.prefix_len, self.prefix_len, self.prefix_len + active_count
+
+    def build_attention_mask(
+        self,
+        seq_len: int,
+        active_start: int,
+        active_end: int,
+    ) -> torch.Tensor:
+        """Build attention mask for the current computation window.
+
+        Active tokens attend bidirectionally to prefix + decoded + buffer + active.
+        Non-active tokens only self-attend (their KV is cached).
+        """
+        mask = torch.zeros(
+            (self.batch_size, 1, seq_len, seq_len),
+            dtype=torch.bool,
+            device=self.device,
+        )
+
+        for i in range(seq_len):
+            if active_start <= i < active_end:
+                mask[:, :, i, :i + 1] = True
+            else:
+                mask[:, :, i, i] = True
+
+        return mask
 
 
 @dataclass
@@ -793,6 +881,98 @@ class OmniVoice(PreTrainedModel):
             "audio_mask": cond_audio_mask,
         }
 
+    def forward(
+        self,
+        input_ids: torch.LongTensor,
+        audio_mask: torch.Tensor,
+        labels: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        document_ids: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values = None,
+        use_cache: bool = False,
+    ):
+        """Forward pass with optional KV cache support.
+
+        Args:
+            input_ids: Audio token IDs, shape (B, C, S).
+            audio_mask: Boolean mask for audio positions, shape (B, S).
+            labels: Optional target labels for loss computation.
+            attention_mask: Optional attention mask.
+            document_ids: Optional document IDs for packed attention.
+            position_ids: Optional position IDs.
+            past_key_values: Cached KV states from a previous step.
+            use_cache: Whether to return updated KV cache.
+        Returns:
+            OmniVoiceModelOutput with logits and optionally past_key_values.
+        """
+        inputs_embeds = self._prepare_embed_inputs(input_ids, audio_mask)
+
+        if attention_mask is None and document_ids is not None:
+            attention_mask = create_block_mask(
+                _get_packed_mask(
+                    document_ids[0].to(inputs_embeds.device),
+                ),
+                B=None,
+                H=None,
+                Q_LEN=input_ids.size(-1),
+                KV_LEN=input_ids.size(-1),
+                _compile=True,
+                device=inputs_embeds.device,
+            )
+
+        llm_kwargs = {
+            "inputs_embeds": inputs_embeds,
+            "attention_mask": attention_mask,
+            "return_dict": True,
+            "position_ids": position_ids,
+        }
+        if past_key_values is not None:
+            llm_kwargs["past_key_values"] = past_key_values
+        if use_cache:
+            llm_kwargs["use_cache"] = True
+
+        llm_outputs = self.llm(**llm_kwargs)
+        hidden_states = llm_outputs[0]
+
+        loss = None
+
+        batch_size, seq_len, _ = hidden_states.shape
+        logits_flat = self.audio_heads(hidden_states)
+        audio_logits = logits_flat.view(
+            batch_size,
+            seq_len,
+            self.config.num_audio_codebook,
+            self.config.audio_vocab_size,
+        ).permute(0, 2, 1, 3)
+
+        if labels is not None:
+            per_token_loss = torch.nn.functional.cross_entropy(
+                audio_logits.permute(0, 3, 1, 2),
+                labels,
+                reduction="none",
+                ignore_index=-100,
+            )
+            valid_mask = (labels != -100).float()
+
+            layer_means = (per_token_loss * valid_mask).sum(
+                dim=(0, 2)
+            ) / valid_mask.sum(dim=(0, 2)).clamp(min=1.0)
+
+            weights = torch.tensor(
+                self.normalized_audio_codebook_weights, device=audio_logits.device
+            )
+            loss = (layer_means * weights).sum()
+
+        output_kwargs = {
+            "loss": loss,
+            "logits": audio_logits,
+        }
+        if use_cache and "past_key_values" in llm_outputs:
+            output_kwargs["past_key_values"] = llm_outputs["past_key_values"]
+
+        return OmniVoiceModelOutput(**output_kwargs)
+
     def _generate_iterative(
         self, task: GenerationTask, gen_config: OmniVoiceGenerationConfig
     ) -> List[torch.Tensor]:
@@ -919,12 +1099,74 @@ class OmniVoice(PreTrainedModel):
         # --- Optimization: torch.compile ---
         forward_fn = self.compiled_forward if gen_config.use_torch_compile else self
 
+        # --- Optimization: KV Cache (Window-Diffusion) ---
+        kv_cache = None
+        if gen_config.use_kv_cache:
+            kv_cache = DiffusionKVCache(
+                prefix_len=max_c_len,
+                max_seq_len=max_c_len + max(task.target_lens),
+                batch_size=2 * B,
+                device=self.device,
+                external_window=gen_config.kv_external_window,
+                internal_window=gen_config.kv_internal_window,
+                refresh_cycle=gen_config.kv_refresh_cycle,
+            )
+
+        max_total_len = max_c_len + max(task.target_lens)
+
         for step in range(gen_config.num_step):
-            batch_logits = forward_fn(
-                input_ids=batch_input_ids,
-                audio_mask=batch_audio_mask,
-                attention_mask=batch_attention_mask,
-            ).logits.to(torch.float32)
+            if kv_cache is not None and not kv_cache.is_refresh_step:
+                # --- Windowed computation ---
+                # Count masked positions for first sample (assume similar for all)
+                num_masked = (
+                    tokens[0, 0, : task.target_lens[0]] == self.config.audio_mask_id
+                ).sum().item()
+
+                prefix_len, active_start, active_end = kv_cache.get_computation_window(
+                    task.target_lens[0], num_masked
+                )
+
+                # Build reduced sequence: prefix + active tokens only
+                reduced_input_ids = batch_input_ids[:, :, :active_end]
+                reduced_audio_mask = batch_audio_mask[:, :active_end]
+                reduced_attention_mask = kv_cache.build_attention_mask(
+                    seq_len=active_end,
+                    active_start=active_start,
+                    active_end=active_end,
+                )
+
+                output = forward_fn(
+                    input_ids=reduced_input_ids,
+                    audio_mask=reduced_audio_mask,
+                    attention_mask=reduced_attention_mask,
+                    past_key_values=kv_cache.kv_cache,
+                    use_cache=False,
+                )
+                reduced_logits = output.logits.to(torch.float32)
+
+                # Pad logits back to full sequence for per-item processing
+                batch_logits = torch.zeros(
+                    (2 * B, self.config.num_audio_codebook, max_total_len, self.config.audio_vocab_size),
+                    dtype=reduced_logits.dtype,
+                    device=reduced_logits.device,
+                )
+                batch_logits[:, :, :active_end, :] = reduced_logits
+
+            else:
+                # --- Full forward pass (refresh step or no KV cache) ---
+                output = forward_fn(
+                    input_ids=batch_input_ids,
+                    audio_mask=batch_audio_mask,
+                    attention_mask=batch_attention_mask,
+                    use_cache=kv_cache is not None,
+                )
+
+                if kv_cache is not None:
+                    past_kv = getattr(output, "past_key_values", None)
+                    if past_kv is not None:
+                        kv_cache.update_cache(past_kv)
+
+                batch_logits = output.logits.to(torch.float32)
 
             # --- Optimization: Speculative decoding ---
             if self._draft_model is not None:
@@ -1012,6 +1254,9 @@ class OmniVoice(PreTrainedModel):
                         converged[i] = True
                 if all_done:
                     break
+
+            if kv_cache is not None:
+                kv_cache.step()
 
         return [tokens[i, :, : task.target_lens[i]] for i in range(B)]
 

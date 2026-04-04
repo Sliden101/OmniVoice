@@ -240,10 +240,35 @@ def get_parser():
         default=None,
         help="Path to smaller draft model for speculative decoding.",
     )
+    parser.add_argument(
+        "--use_kv_cache",
+        type=str2bool,
+        default=False,
+        help="Enable Window-Diffusion KV cache for faster inference.",
+    )
+    parser.add_argument(
+        "--kv_external_window",
+        type=int,
+        default=128,
+        help="External window length for KV cache.",
+    )
+    parser.add_argument(
+        "--kv_internal_window",
+        type=int,
+        default=16,
+        help="Internal window length for KV cache (active tokens).",
+    )
+    parser.add_argument(
+        "--kv_refresh_cycle",
+        type=int,
+        default=4,
+        help="KV cache refresh interval (full forward pass every N steps).",
+    )
     return parser
 
 
-def process_init(rank_queue, model_checkpoint, warmup=0, quantization="none", draft_model=None):
+def process_init(rank_queue, model_checkpoint, warmup=0, quantization="none", draft_model=None,
+                 use_kv_cache=False, kv_external_window=128, kv_internal_window=16, kv_refresh_cycle=4):
     """Initializer for each worker process.
 
     Loads model (with tokenizers and duration estimator) onto a specific GPU
@@ -500,7 +525,8 @@ def main():
         with ProcessPoolExecutor(
             max_workers=num_processes,
             initializer=process_init,
-            initargs=(rank_queue, args.model, args.warmup, args.quantization, args.draft_model),
+            initargs=(rank_queue, args.model, args.warmup, args.quantization, args.draft_model,
+                      args.use_kv_cache, args.kv_external_window, args.kv_internal_window, args.kv_refresh_cycle),
         ) as executor:
             futures = []
 

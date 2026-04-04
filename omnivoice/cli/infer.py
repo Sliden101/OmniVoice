@@ -153,6 +153,30 @@ def get_parser() -> argparse.ArgumentParser:
         help="Path to smaller draft model for speculative decoding.",
     )
     parser.add_argument(
+        "--use_kv_cache",
+        type=str2bool,
+        default=False,
+        help="Enable Window-Diffusion KV cache for faster inference.",
+    )
+    parser.add_argument(
+        "--kv_external_window",
+        type=int,
+        default=128,
+        help="External window length for KV cache.",
+    )
+    parser.add_argument(
+        "--kv_internal_window",
+        type=int,
+        default=16,
+        help="Internal window length for KV cache (active tokens).",
+    )
+    parser.add_argument(
+        "--kv_refresh_cycle",
+        type=int,
+        default=4,
+        help="KV cache refresh interval (full forward pass every N steps).",
+    )
+    parser.add_argument(
         "--device",
         type=str,
         default=None,
@@ -199,6 +223,10 @@ def main():
         use_torch_compile=args.use_torch_compile,
         fast_mode=args.fast_mode,
         ultra_mode=args.ultra_mode,
+        use_kv_cache=args.use_kv_cache,
+        kv_external_window=args.kv_external_window,
+        kv_internal_window=args.kv_internal_window,
+        kv_refresh_cycle=args.kv_refresh_cycle,
     )
 
     torchaudio.save(args.output, audios[0], model.sampling_rate)
