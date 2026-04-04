@@ -177,6 +177,12 @@ def get_parser() -> argparse.ArgumentParser:
         help="KV cache refresh interval (full forward pass every N steps).",
     )
     parser.add_argument(
+        "--sequential_cfg",
+        type=str2bool,
+        default=False,
+        help="Run cond/uncond CFG forward passes sequentially to save VRAM.",
+    )
+    parser.add_argument(
         "--device",
         type=str,
         default=None,
@@ -227,6 +233,7 @@ def main():
         kv_external_window=args.kv_external_window,
         kv_internal_window=args.kv_internal_window,
         kv_refresh_cycle=args.kv_refresh_cycle,
+        sequential_cfg=args.sequential_cfg,
     )
 
     torchaudio.save(args.output, audios[0], model.sampling_rate)

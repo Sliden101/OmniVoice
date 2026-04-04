@@ -264,11 +264,18 @@ def get_parser():
         default=4,
         help="KV cache refresh interval (full forward pass every N steps).",
     )
+    parser.add_argument(
+        "--sequential_cfg",
+        type=str2bool,
+        default=False,
+        help="Run cond/uncond CFG forward passes sequentially to save VRAM.",
+    )
     return parser
 
 
 def process_init(rank_queue, model_checkpoint, warmup=0, quantization="none", draft_model=None,
-                 use_kv_cache=False, kv_external_window=128, kv_internal_window=16, kv_refresh_cycle=4):
+                 use_kv_cache=False, kv_external_window=128, kv_internal_window=16, kv_refresh_cycle=4,
+                 sequential_cfg=False):
     """Initializer for each worker process.
 
     Loads model (with tokenizers and duration estimator) onto a specific GPU
@@ -526,7 +533,8 @@ def main():
             max_workers=num_processes,
             initializer=process_init,
             initargs=(rank_queue, args.model, args.warmup, args.quantization, args.draft_model,
-                      args.use_kv_cache, args.kv_external_window, args.kv_internal_window, args.kv_refresh_cycle),
+                      args.use_kv_cache, args.kv_external_window, args.kv_internal_window, args.kv_refresh_cycle,
+                      args.sequential_cfg),
         ) as executor:
             futures = []
 

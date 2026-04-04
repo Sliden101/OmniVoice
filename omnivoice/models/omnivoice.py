@@ -112,6 +112,7 @@ class OmniVoiceGenerationConfig:
     kv_external_window: int = 128
     kv_internal_window: int = 16
     kv_refresh_cycle: int = 4
+    sequential_cfg: bool = False
 
     def __post_init__(self):
         if self.ultra_mode:
@@ -122,6 +123,7 @@ class OmniVoiceGenerationConfig:
             self.credit_alpha = 2.0
             self.credit_beta = 0.95
             self.use_kv_cache = True
+            self.sequential_cfg = True
         elif self.fast_mode:
             self.num_step = max(1, self.num_step // 2)
             self.early_termination = True
@@ -129,6 +131,7 @@ class OmniVoiceGenerationConfig:
             self.use_torch_compile = True
             self.credit_alpha = 2.0
             self.credit_beta = 0.95
+            self.sequential_cfg = True
 
     @classmethod
     def from_dict(cls, kwargs_dict):
@@ -1117,7 +1120,6 @@ class OmniVoice(PreTrainedModel):
         for step in range(gen_config.num_step):
             if kv_cache is not None and not kv_cache.is_refresh_step:
                 # --- Windowed computation ---
-                # Count masked positions for first sample (assume similar for all)
                 num_masked = (
                     tokens[0, 0, : task.target_lens[0]] == self.config.audio_mask_id
                 ).sum().item()
@@ -1126,7 +1128,6 @@ class OmniVoice(PreTrainedModel):
                     task.target_lens[0], num_masked
                 )
 
-                # Build reduced sequence: prefix + active tokens only
                 reduced_input_ids = batch_input_ids[:, :, :active_end]
                 reduced_audio_mask = batch_audio_mask[:, :active_end]
                 reduced_attention_mask = kv_cache.build_attention_mask(
@@ -1135,38 +1136,93 @@ class OmniVoice(PreTrainedModel):
                     active_end=active_end,
                 )
 
-                output = forward_fn(
-                    input_ids=reduced_input_ids,
-                    audio_mask=reduced_audio_mask,
-                    attention_mask=reduced_attention_mask,
-                    past_key_values=kv_cache.kv_cache,
-                    use_cache=False,
-                )
-                reduced_logits = output.logits.to(torch.float32)
+                if gen_config.sequential_cfg:
+                    # --- Sequential CFG: run cond/uncond separately to save VRAM ---
+                    c_out = forward_fn(
+                        input_ids=reduced_input_ids[:B],
+                        audio_mask=reduced_audio_mask[:B],
+                        attention_mask=reduced_attention_mask[:B],
+                        past_key_values=kv_cache.kv_cache,
+                        use_cache=False,
+                    )
+                    c_logits = c_out.logits  # stays fp16
+                    u_out = forward_fn(
+                        input_ids=reduced_input_ids[B:],
+                        audio_mask=reduced_audio_mask[B:],
+                        attention_mask=reduced_attention_mask[B:],
+                        past_key_values=kv_cache.kv_cache,
+                        use_cache=False,
+                    )
+                    u_logits = u_out.logits  # stays fp16
+                    del c_out, u_out
+                else:
+                    output = forward_fn(
+                        input_ids=reduced_input_ids,
+                        audio_mask=reduced_audio_mask,
+                        attention_mask=reduced_attention_mask,
+                        past_key_values=kv_cache.kv_cache,
+                        use_cache=False,
+                    )
+                    reduced_logits = output.logits
+                    del output
 
-                # Pad logits back to full sequence for per-item processing
+                    # Split into cond/uncond for per-sample processing
+                    c_logits = reduced_logits[:B]
+                    u_logits = reduced_logits[B:]
+                    del reduced_logits
+
+                # Pad logits back to full sequence
                 batch_logits = torch.zeros(
                     (2 * B, self.config.num_audio_codebook, max_total_len, self.config.audio_vocab_size),
-                    dtype=reduced_logits.dtype,
-                    device=reduced_logits.device,
+                    dtype=c_logits.dtype,
+                    device=c_logits.device,
                 )
-                batch_logits[:, :, :active_end, :] = reduced_logits
+                batch_logits[:B, :, :active_end, :] = c_logits
+                batch_logits[B:, :, :active_end, :] = u_logits
+                del c_logits, u_logits
 
             else:
                 # --- Full forward pass (refresh step or no KV cache) ---
-                output = forward_fn(
-                    input_ids=batch_input_ids,
-                    audio_mask=batch_audio_mask,
-                    attention_mask=batch_attention_mask,
-                    use_cache=kv_cache is not None,
-                )
+                if gen_config.sequential_cfg:
+                    # --- Sequential CFG: run cond/uncond separately to save VRAM ---
+                    c_out = forward_fn(
+                        input_ids=batch_input_ids[:B],
+                        audio_mask=batch_audio_mask[:B],
+                        attention_mask=batch_attention_mask[:B],
+                        use_cache=kv_cache is not None,
+                    )
+                    c_logits = c_out.logits  # stays fp16
+                    u_out = forward_fn(
+                        input_ids=batch_input_ids[B:],
+                        audio_mask=batch_audio_mask[B:],
+                        attention_mask=batch_attention_mask[B:],
+                        use_cache=kv_cache is not None,
+                    )
+                    u_logits = u_out.logits  # stays fp16
+                    del c_out, u_out
 
-                if kv_cache is not None:
-                    past_kv = getattr(output, "past_key_values", None)
-                    if past_kv is not None:
-                        kv_cache.update_cache(past_kv)
+                    if kv_cache is not None:
+                        past_kv = getattr(c_out, "past_key_values", None)
+                        if past_kv is not None:
+                            kv_cache.update_cache(past_kv)
+                else:
+                    output = forward_fn(
+                        input_ids=batch_input_ids,
+                        audio_mask=batch_audio_mask,
+                        attention_mask=batch_attention_mask,
+                        use_cache=kv_cache is not None,
+                    )
+                    if kv_cache is not None:
+                        past_kv = getattr(output, "past_key_values", None)
+                        if past_kv is not None:
+                            kv_cache.update_cache(past_kv)
+                    c_logits = output.logits[:B]
+                    u_logits = output.logits[B:]
+                    del output
 
-                batch_logits = output.logits.to(torch.float32)
+                # Reconstruct full batch_logits for per-item processing
+                batch_logits = torch.cat([c_logits, u_logits], dim=0)
+                del c_logits, u_logits
 
             # --- Optimization: Speculative decoding ---
             if self._draft_model is not None:
@@ -1175,12 +1231,13 @@ class OmniVoice(PreTrainedModel):
                         input_ids=batch_input_ids,
                         audio_mask=batch_audio_mask,
                         attention_mask=batch_attention_mask,
-                    ).logits.to(torch.float32)
+                    ).logits
 
                 draft_pred = draft_logits.argmax(dim=-1)
                 main_pred = batch_logits.argmax(dim=-1)
                 agreement = (draft_pred == main_pred).unsqueeze(-1).float()
                 batch_logits = batch_logits * (1.0 + 0.3 * agreement)
+                del draft_logits, draft_pred, main_pred, agreement
 
             for i in range(B):
                 # --- Optimization: skip converged samples ---
@@ -1204,7 +1261,7 @@ class OmniVoice(PreTrainedModel):
 
                 # --- Optimization: Credit Decoding ---
                 if gen_config.use_credit_decoding:
-                    c_log_probs = F.log_softmax(c_logits, dim=-1)
+                    c_log_probs = F.log_softmax(c_logits.float(), dim=-1)
                     top_token_mask = torch.zeros_like(c_log_probs)
                     top_token_mask.scatter_(-1, pred_tokens.unsqueeze(-1), 1.0)
                     top_log_prob = (c_log_probs * top_token_mask).sum(dim=-1)
@@ -1258,18 +1315,24 @@ class OmniVoice(PreTrainedModel):
             if kv_cache is not None:
                 kv_cache.step()
 
+            # --- Optimization: Explicit tensor cleanup ---
+            del batch_logits
+            if step % 4 == 0 and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
         return [tokens[i, :, : task.target_lens[i]] for i in range(B)]
 
     def _predict_tokens_with_scoring(self, c_logits, u_logits, gen_config):
+        # Cast to fp32 only for softmax (numerical stability), keep rest in original dtype
         if gen_config.guidance_scale != 0:
-            c_log_probs = F.log_softmax(c_logits, dim=-1)
-            u_log_probs = F.log_softmax(u_logits, dim=-1)
+            c_log_probs = F.log_softmax(c_logits.float(), dim=-1)
+            u_log_probs = F.log_softmax(u_logits.float(), dim=-1)
             log_probs = torch.log_softmax(
                 c_log_probs + gen_config.guidance_scale * (c_log_probs - u_log_probs),
                 dim=-1,
             )
         else:
-            log_probs = F.log_softmax(c_logits, dim=-1)
+            log_probs = F.log_softmax(c_logits.float(), dim=-1)
 
         log_probs[..., self.config.audio_mask_id] = -float("inf")
 
