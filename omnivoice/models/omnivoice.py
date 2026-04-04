@@ -119,7 +119,6 @@ class OmniVoiceGenerationConfig:
             self.num_step = max(1, self.num_step // 4)
             self.early_termination = True
             self.use_credit_decoding = True
-            self.use_torch_compile = True
             self.credit_alpha = 2.0
             self.credit_beta = 0.95
             self.use_kv_cache = True
@@ -128,7 +127,6 @@ class OmniVoiceGenerationConfig:
             self.num_step = max(1, self.num_step // 2)
             self.early_termination = True
             self.use_credit_decoding = True
-            self.use_torch_compile = True
             self.credit_alpha = 2.0
             self.credit_beta = 0.95
             self.sequential_cfg = True
@@ -1317,8 +1315,6 @@ class OmniVoice(PreTrainedModel):
 
             # --- Optimization: Explicit tensor cleanup ---
             del batch_logits
-            if step % 4 == 0 and torch.cuda.is_available():
-                torch.cuda.empty_cache()
 
         return [tokens[i, :, : task.target_lens[i]] for i in range(B)]
 
