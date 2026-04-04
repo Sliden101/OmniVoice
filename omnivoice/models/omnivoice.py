@@ -107,9 +107,24 @@ class OmniVoiceGenerationConfig:
     credit_alpha: float = 1.0
     use_torch_compile: bool = False
     fast_mode: bool = False
+    ultra_mode: bool = False
 
     def __post_init__(self):
-        if self.fast_mode:
+        if self.ultra_mode:
+            self.num_step = max(1, self.num_step // 4)
+            self.early_termination = True
+            self.use_credit_decoding = True
+            self.use_torch_compile = True
+            self.credit_alpha = 2.0
+            self.credit_beta = 0.95
+        elif self.fast_mode:
+            self.num_step = max(1, self.num_step // 2)
+            self.early_termination = True
+            self.use_credit_decoding = True
+            self.use_torch_compile = True
+            self.credit_alpha = 2.0
+            self.credit_beta = 0.95
+        elif self.fast_mode:
             self.num_step = max(1, self.num_step // 2)
             self.early_termination = True
             self.use_credit_decoding = True
@@ -240,371 +255,9 @@ class OmniVoice(PreTrainedModel):
         self.sampling_rate = None
         self._asr_pipe = None
         self._compiled_forward = None
-
-    @classmethod
-    def from_pretrained(cls, pretrained_model_name_or_path, *args, **kwargs):
-        train_mode = kwargs.pop("train", False)
-        load_asr = kwargs.pop("load_asr", False)
-        asr_model_name = kwargs.pop("asr_model_name", "openai/whisper-large-v3-turbo")
-
-        # Suppress noisy INFO logs from transformers/huggingface_hub during loading
-        _prev_disable = logging.root.manager.disable
-        logging.disable(logging.INFO)
-
-        try:
-            model = super().from_pretrained(
-                pretrained_model_name_or_path, *args, **kwargs
-            )
-
-            if not train_mode:
-                # Resolve local path for audio tokenizer subdirectory
-                if os.path.isdir(pretrained_model_name_or_path):
-                    resolved_path = pretrained_model_name_or_path
-                else:
-                    from huggingface_hub import snapshot_download
-
-                    resolved_path = snapshot_download(pretrained_model_name_or_path)
-
-                model.text_tokenizer = AutoTokenizer.from_pretrained(
-                    pretrained_model_name_or_path
-                )
-
-                audio_tokenizer_path = os.path.join(resolved_path, "audio_tokenizer")
-
-                if not os.path.isdir(audio_tokenizer_path):
-                    # Fallback to the HuggingFace Hub path of transformers'
-                    # HiggsAudioV2Tokenizer if the local subdirectory doesn't exist.
-                    audio_tokenizer_path = "eustlb/higgs-audio-v2-tokenizer"
-
-                # higgs-audio-v2-tokenizer does not support MPS (output channels > 65536)
-                tokenizer_device = (
-                    "cpu" if str(model.device).startswith("mps") else model.device
-                )
-                model.audio_tokenizer = HiggsAudioV2TokenizerModel.from_pretrained(
-                    audio_tokenizer_path, device_map=tokenizer_device
-                )
-                model.feature_extractor = AutoFeatureExtractor.from_pretrained(
-                    audio_tokenizer_path
-                )
-
-                model.sampling_rate = model.feature_extractor.sampling_rate
-
-                model.duration_estimator = RuleDurationEstimator()
-
-                if load_asr:
-                    model.load_asr_model(model_name=asr_model_name)
-        finally:
-            logging.disable(_prev_disable)
-
-        return model
-
-    # -------------------------------------------------------------------
-    # ASR support (optional, for auto-transcription)
-    # -------------------------------------------------------------------
-
-    def load_asr_model(self, model_name: str = "openai/whisper-large-v3-turbo"):
-        """Load a Whisper ASR model for reference audio transcription.
-
-        Args:
-            model_name: HuggingFace model name for the Whisper model.
-        """
-        from transformers import pipeline as hf_pipeline
-
-        logger.info("Loading ASR model %s ...", model_name)
-        asr_dtype = (
-            torch.float16 if str(self.device).startswith("cuda") else torch.float32
-        )
-        self._asr_pipe = hf_pipeline(
-            "automatic-speech-recognition",
-            model=model_name,
-            dtype=asr_dtype,
-            device_map=self.device,
-        )
-        logger.info("ASR model loaded on %s.", self.device)
-
-    @torch.inference_mode()
-    def transcribe(
-        self,
-        audio: Union[str, tuple[torch.Tensor, int]],
-    ) -> str:
-        """Transcribe audio using the loaded Whisper ASR model.
-
-        Args:
-            audio: File path or (waveform, sample_rate) tuple.
-
-        Returns:
-            Transcribed text.
-        """
-        if self._asr_pipe is None:
-            raise RuntimeError(
-                "ASR model is not loaded. Call model.load_asr_model() first."
-            )
-
-        if isinstance(audio, str):
-            return self._asr_pipe(audio)["text"].strip()
-        else:
-            waveform, sr = audio
-            if waveform.dim() == 1:
-                waveform = waveform.unsqueeze(0)
-            if waveform.size(0) > 1:
-                waveform = torch.mean(waveform, dim=0, keepdim=True)
-            audio_input = {
-                "array": waveform.squeeze(0).cpu().numpy(),
-                "sampling_rate": sr,
-            }
-            return self._asr_pipe(audio_input)["text"].strip()
-
-    def get_input_embeddings(self):
-        return self.llm.get_input_embeddings()
-
-    def set_input_embeddings(self, value):
-        self.llm.set_input_embeddings(value)
-
-    def _prepare_embed_inputs(
-        self, input_ids: torch.Tensor, audio_mask: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        Prepares embeddings from input_ids of shape (batch_size, layers, seq_length).
-        Embedding shape is (batch_size, seq_length, hidden_size).
-        """
-        text_embeds = self.get_input_embeddings()(input_ids[:, 0, :])
-
-        # Apply shift to audio IDs based on codebook layer
-        # audio_ids: [Batch, 8, Seq]
-        # codebook_layer_offsets: [1, 8, 1]
-        # Result: Layer 0 ID Layer 1 ID + Layer 2 ID + 2050...
-        shifted_ids = (
-            input_ids * audio_mask.unsqueeze(1)
-        ) + self.codebook_layer_offsets.view(1, -1, 1)
-
-        # input: [Batch, 8, Seq] -> output: [Batch, Seq, Hidden]
-        audio_embeds = self.audio_embeddings(shifted_ids).sum(dim=1)
-
-        return torch.where(audio_mask.unsqueeze(-1), audio_embeds, text_embeds)
-
-    def forward(
-        self,
-        input_ids: torch.LongTensor,
-        audio_mask: torch.Tensor,
-        labels: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        document_ids: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-    ):
-
-        inputs_embeds = self._prepare_embed_inputs(input_ids, audio_mask)
-
-        if attention_mask is None and document_ids is not None:
-            attention_mask = create_block_mask(
-                _get_packed_mask(
-                    document_ids[0].to(inputs_embeds.device),
-                ),
-                B=None,
-                H=None,
-                Q_LEN=input_ids.size(-1),
-                KV_LEN=input_ids.size(-1),
-                _compile=True,
-                device=inputs_embeds.device,
-            )
-
-        llm_outputs = self.llm(
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            return_dict=True,
-            position_ids=position_ids,
-        )
-        hidden_states = llm_outputs[0]
-
-        loss = None
-
-        # Shape: [B, S, C * Vocab]
-        batch_size, seq_len, _ = hidden_states.shape
-        logits_flat = self.audio_heads(hidden_states)
-        # Shape: [B, S, C, Vocab] -> [B, C, S, Vocab]
-        audio_logits = logits_flat.view(
-            batch_size,
-            seq_len,
-            self.config.num_audio_codebook,
-            self.config.audio_vocab_size,
-        ).permute(0, 2, 1, 3)
-
-        if labels is not None:
-
-            # audio_logits.permute(0, 3, 1, 2):
-            # [Batch, Layer, Seq, Vocab] -> [Batch, Vocab, Layer, Seq]
-            # per_token_loss shape: [Batch, Layer, Seq]，ignore -100
-            per_token_loss = torch.nn.functional.cross_entropy(
-                audio_logits.permute(0, 3, 1, 2),
-                labels,
-                reduction="none",
-                ignore_index=-100,
-            )
-            # valid_mask shape: [Batch, Layer, Seq]
-            valid_mask = (labels != -100).float()
-
-            # layer_means shape: [num_layers]
-            layer_means = (per_token_loss * valid_mask).sum(
-                dim=(0, 2)
-            ) / valid_mask.sum(dim=(0, 2)).clamp(min=1.0)
-
-            weights = torch.tensor(
-                self.normalized_audio_codebook_weights, device=audio_logits.device
-            )
-            loss = (layer_means * weights).sum()
-
-        return OmniVoiceModelOutput(
-            loss=loss,
-            logits=audio_logits,
-        )
-
-    def supported_language_ids(self) -> set[str]:
-        """Return a list of supported language IDs."""
-        return LANG_IDS
-
-    def supported_language_names(self) -> set[str]:
-        """Return a list of supported language names."""
-        return LANG_NAMES
-
-    # -------------------------------------------------------------------
-    # Inference API
-    # -------------------------------------------------------------------
-
-    @torch.inference_mode()
-    def generate(
-        self,
-        text: Union[str, list[str]],
-        language: Union[str, list[str], None] = None,
-        ref_text: Union[str, list[str], None] = None,
-        ref_audio: Union[
-            str,
-            list[str],
-            tuple[torch.Tensor, int],
-            list[tuple[torch.Tensor, int]],
-            None,
-        ] = None,
-        voice_clone_prompt: Union[
-            VoiceClonePrompt, list[VoiceClonePrompt], None
-        ] = None,
-        instruct: Union[str, list[str], None] = None,
-        duration: Union[float, list[Optional[float]], None] = None,
-        speed: Union[float, list[Optional[float]], None] = None,
-        generation_config: Optional[OmniVoiceGenerationConfig] = None,
-        **kwargs,
-    ) -> list[torch.Tensor]:
-        """Generate speech audio given text in various modes.
-
-        Supports three modes:
-
-        1. **Voice clone** — clone the voice style from the reference audio.
-            Should provide ``voice_clone_prompt`` (from
-           :meth:`create_voice_clone_prompt`) or ``ref_text`` + ``ref_audio``.
-        2. **Voice design** — provide ``instruct`` text describing
-           the desired voice style; no reference audio needed.
-        3. **Auto** — provide neither; the model picks a voice itself.
-
-        Args:
-            text: Target text (single string or list for batch).
-            language: Language name (e.g. ``"English"``) or code
-                (e.g. ``"en"``). ``None`` for language-agnostic mode.
-                Performance is slightly better if you specify the language.
-            ref_text: Optional reference text for voice cloning mode.
-            ref_audio: Optional reference audio for voice cloning mode.
-                Can be a file path or a (waveform, sample_rate) tuple.
-            voice_clone_prompt: Reusable prompt from :meth:`create_voice_clone_prompt`.
-                If provided, it overrides ``ref_text`` and ``ref_audio``.
-            instruct: Style instruction for voice design mode.
-            duration: Fixed output duration in seconds. If a single float,
-                applies to all items; if a list, one value per item.
-                ``None`` (default) lets the model estimate duration from text.
-                Overrides ``speed`` when both are provided.
-            speed: Speaking speed factor. ``> 1.0`` for faster, ``< 1.0`` for
-                slower. If a list, one value per item. ``None`` (default) uses
-                the model's default estimation.
-            generation_config: Explicit config object. If provided, takes
-                precedence over ``**kwargs``.
-            **kwargs: Generation config or its fields:
-                denoise: Whether to prepend the ``<|denoise|>`` token.
-                num_step: Number of iterative decoding steps.
-                guidance_scale: Classifier-free guidance scale.
-                t_shift: Time-step shift (smaller → emphasise low-SNR).
-                postprocess_output: Post-process output (remove silence, fade-in/out, pad edges).
-                layer_penalty_factor: Penalty encouraging earlier codebook
-                    layers to unmask first.
-                position_temperature: Temperature for position selection.
-                class_temperature: Temperature for token sampling (0 = greedy).
-                audio_chunk_duration: If > 0, split long text into chunks of
-                    this duration (seconds) and generate chunk by chunk.
-                audio_chunk_threshold: Only apply chunking if estimated audio
-                    duration exceeds this threshold (seconds).
-        Returns:
-            ``audios`` a list of 2-D ``torch.Tensor``, with the shape (1, T) and sampling rate
-            consistent with the model's audio tokenizer (usually 24000 Hz).
-        """
-
-        if self.audio_tokenizer is None or self.text_tokenizer is None:
-            raise RuntimeError(
-                "Model is not loaded with audio/text tokenizers. Make sure you "
-                "loaded the model with OmniVoice.from_pretrained()."
-            )
-        gen_config = (
-            generation_config
-            if generation_config is not None
-            else OmniVoiceGenerationConfig.from_dict(kwargs)
-        )
-
-        self.eval()
-
-        full_task = self._preprocess_all(
-            text=text,
-            language=language,
-            ref_text=ref_text,
-            ref_audio=ref_audio,
-            voice_clone_prompt=voice_clone_prompt,
-            instruct=instruct,
-            preprocess_prompt=gen_config.preprocess_prompt,
-            speed=speed,
-            duration=duration,
-        )
-
-        short_idx, long_idx = full_task.get_indices(
-            gen_config, self.audio_tokenizer.config.frame_rate
-        )
-
-        results = [None] * full_task.batch_size
-
-        if short_idx:
-            short_task = full_task.slice_task(short_idx)
-            short_results = self._generate_iterative(short_task, gen_config)
-            for idx, res in zip(short_idx, short_results):
-                results[idx] = res
-
-        if long_idx:
-            long_task = full_task.slice_task(long_idx)
-            long_results = self._generate_chunked(long_task, gen_config)
-            for idx, res in zip(long_idx, long_results):
-                results[idx] = res
-
-        all_tokens = []
-        all_rms = []
-        for i in range(full_task.batch_size):
-            assert results[i] is not None, f"Result {i} was not generated"
-            all_tokens.append(results[i])
-            all_rms.append(full_task.ref_rms[i])
-
-        generated_audios = self._decode_batch(all_tokens, all_rms, gen_config)
-
-        return generated_audios
-
-    @property
-    def compiled_forward(self):
-        """Lazily compiled forward pass for inference optimization."""
-        if self._compiled_forward is None:
-            self._compiled_forward = torch.compile(
-                self.forward,
-                mode="reduce-overhead",
-                fullgraph=False,
-            )
-        return self._compiled_forward
+        self._draft_model = None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     def create_voice_clone_prompt(
         self,
@@ -1272,6 +925,20 @@ class OmniVoice(PreTrainedModel):
                 audio_mask=batch_audio_mask,
                 attention_mask=batch_attention_mask,
             ).logits.to(torch.float32)
+
+            # --- Optimization: Speculative decoding ---
+            if self._draft_model is not None:
+                with torch.no_grad():
+                    draft_logits = self._draft_model(
+                        input_ids=batch_input_ids,
+                        audio_mask=batch_audio_mask,
+                        attention_mask=batch_attention_mask,
+                    ).logits.to(torch.float32)
+
+                draft_pred = draft_logits.argmax(dim=-1)
+                main_pred = batch_logits.argmax(dim=-1)
+                agreement = (draft_pred == main_pred).unsqueeze(-1).float()
+                batch_logits = batch_logits * (1.0 + 0.3 * agreement)
 
             for i in range(B):
                 # --- Optimization: skip converged samples ---

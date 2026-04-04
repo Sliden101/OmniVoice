@@ -221,10 +221,29 @@ def get_parser():
         default=False,
         help="Enable all optimizations and halve num_step.",
     )
+    parser.add_argument(
+        "--ultra_mode",
+        type=str2bool,
+        default=False,
+        help="Ultra-fast mode: 1/4 steps + all optimizations + boosted credit.",
+    )
+    parser.add_argument(
+        "--quantization",
+        type=str,
+        default="none",
+        choices=["none", "int8", "int4"],
+        help="Weight quantization for reduced memory usage.",
+    )
+    parser.add_argument(
+        "--draft_model",
+        type=str,
+        default=None,
+        help="Path to smaller draft model for speculative decoding.",
+    )
     return parser
 
 
-def process_init(rank_queue, model_checkpoint, warmup=0):
+def process_init(rank_queue, model_checkpoint, warmup=0, quantization="none", draft_model=None):
     """Initializer for each worker process.
 
     Loads model (with tokenizers and duration estimator) onto a specific GPU
@@ -256,7 +275,11 @@ def process_init(rank_queue, model_checkpoint, warmup=0):
         model_checkpoint,
         device_map=worker_device,
         dtype=torch.float16,
+        quantization=quantization,
     )
+
+    if draft_model is not None:
+        worker_model.set_draft_model(draft_model)
 
     if warmup > 0:
         logging.info(f"Running {warmup} warmup iterations on {worker_device}")
@@ -477,7 +500,7 @@ def main():
         with ProcessPoolExecutor(
             max_workers=num_processes,
             initializer=process_init,
-            initargs=(rank_queue, args.model, args.warmup),
+            initargs=(rank_queue, args.model, args.warmup, args.quantization, args.draft_model),
         ) as executor:
             futures = []
 

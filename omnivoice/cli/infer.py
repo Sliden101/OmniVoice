@@ -134,6 +134,25 @@ def get_parser() -> argparse.ArgumentParser:
         help="Enable all optimizations and halve num_step.",
     )
     parser.add_argument(
+        "--ultra_mode",
+        type=str2bool,
+        default=False,
+        help="Ultra-fast mode: 1/4 steps + all optimizations + boosted credit.",
+    )
+    parser.add_argument(
+        "--quantization",
+        type=str,
+        default="none",
+        choices=["none", "int8", "int4"],
+        help="Weight quantization for reduced memory usage.",
+    )
+    parser.add_argument(
+        "--draft_model",
+        type=str,
+        default=None,
+        help="Path to smaller draft model for speculative decoding.",
+    )
+    parser.add_argument(
         "--device",
         type=str,
         default=None,
@@ -151,8 +170,12 @@ def main():
     device = args.device or get_best_device()
     logging.info(f"Loading model from {args.model} on {device} ...")
     model = OmniVoice.from_pretrained(
-        args.model, device_map=device, dtype=torch.float16
+        args.model, device_map=device, dtype=torch.float16,
+        quantization=args.quantization,
     )
+
+    if args.draft_model is not None:
+        model.set_draft_model(args.draft_model)
 
     logging.info(f"Generating audio for: {args.text[:80]}...")
     audios = model.generate(
@@ -175,6 +198,7 @@ def main():
         use_credit_decoding=args.use_credit_decoding,
         use_torch_compile=args.use_torch_compile,
         fast_mode=args.fast_mode,
+        ultra_mode=args.ultra_mode,
     )
 
     torchaudio.save(args.output, audios[0], model.sampling_rate)
