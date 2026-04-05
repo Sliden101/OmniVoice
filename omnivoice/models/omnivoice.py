@@ -770,6 +770,110 @@ class OmniVoice(PreTrainedModel):
             speed=speed_list,
         )
 
+    @torch.inference_mode()
+    def generate(
+        self,
+        text: Union[str, list[str]],
+        language: Union[str, list[str], None] = None,
+        ref_text: Union[str, list[str], None] = None,
+        ref_audio: Union[
+            str,
+            list[str],
+            tuple[torch.Tensor, int],
+            list[tuple[torch.Tensor, int]],
+            None,
+        ] = None,
+        voice_clone_prompt: Union[
+            VoiceClonePrompt, list[VoiceClonePrompt], None
+        ] = None,
+        instruct: Union[str, list[str], None] = None,
+        duration: Union[float, list[Optional[float]], None] = None,
+        speed: Union[float, list[Optional[float]], None] = None,
+        generation_config: Optional[OmniVoiceGenerationConfig] = None,
+        **kwargs,
+    ) -> list[torch.Tensor]:
+        """Generate speech audio given text in various modes.
+
+        Supports three modes:
+
+        1. **Voice clone** — clone the voice style from the reference audio.
+            Should provide ``voice_clone_prompt`` (from
+           :meth:`create_voice_clone_prompt`) or ``ref_text`` + ``ref_audio``.
+        2. **Voice design** — provide ``instruct`` text describing
+           the desired voice style; no reference audio needed.
+        3. **Auto** — provide neither; the model picks a voice itself.
+
+        Args:
+            text: Target text (single string or list for batch).
+            language: Language name (e.g. ``"English"``) or code
+                (e.g. ``"en"``). ``None`` for language-agnostic mode.
+            ref_text: Optional reference text for voice cloning mode.
+            ref_audio: Optional reference audio for voice cloning mode.
+                Can be a file path or a (waveform, sample_rate) tuple.
+            voice_clone_prompt: Reusable prompt from :meth:`create_voice_clone_prompt`.
+                If provided, it overrides ``ref_text`` and ``ref_audio``.
+            instruct: Style instruction for voice design mode.
+            duration: Fixed output duration in seconds.
+            speed: Speaking speed factor. ``> 1.0`` for faster, ``< 1.0`` for slower.
+            generation_config: Explicit config object. If provided, takes
+                precedence over ``**kwargs``.
+            **kwargs: Generation config fields (num_step, guidance_scale, etc.)
+        Returns:
+            List of audio tensors, each shape (1, T), sampling rate 24000 Hz.
+        """
+        if self.audio_tokenizer is None or self.text_tokenizer is None:
+            raise RuntimeError(
+                "Model is not loaded with audio/text tokenizers. Make sure you "
+                "loaded the model with OmniVoice.from_pretrained()."
+            )
+        gen_config = (
+            generation_config
+            if generation_config is not None
+            else OmniVoiceGenerationConfig.from_dict(kwargs)
+        )
+
+        self.eval()
+
+        full_task = self._preprocess_all(
+            text=text,
+            language=language,
+            ref_text=ref_text,
+            ref_audio=ref_audio,
+            voice_clone_prompt=voice_clone_prompt,
+            instruct=instruct,
+            preprocess_prompt=gen_config.preprocess_prompt,
+            speed=speed,
+            duration=duration,
+        )
+
+        short_idx, long_idx = full_task.get_indices(
+            gen_config, self.audio_tokenizer.config.frame_rate
+        )
+
+        results = [None] * full_task.batch_size
+
+        if short_idx:
+            short_task = full_task.slice_task(short_idx)
+            short_results = self._generate_iterative(short_task, gen_config)
+            for idx, res in zip(short_idx, short_results):
+                results[idx] = res
+
+        if long_idx:
+            long_task = full_task.slice_task(long_idx)
+            long_results = self._generate_chunked(long_task, gen_config)
+            for idx, res in zip(long_idx, long_results):
+                results[idx] = res
+
+        all_tokens = []
+        all_rms = []
+        for i in range(full_task.batch_size):
+            assert results[i] is not None, f"Result {i} was not generated"
+            all_tokens.append(results[i])
+            all_rms.append(full_task.ref_rms[i])
+
+        generated_audios = self._decode_batch(all_tokens, all_rms, gen_config)
+        return generated_audios
+
     def _estimate_target_tokens(self, text, ref_text, num_ref_audio_tokens, speed=1.0):
         """Estimate number of target audio tokens."""
         if num_ref_audio_tokens is None or ref_text is None or len(ref_text) == 0:
