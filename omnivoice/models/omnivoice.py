@@ -348,6 +348,74 @@ class OmniVoice(PreTrainedModel):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path, *args, **kwargs):
+        train_mode = kwargs.pop("train", False)
+        load_asr = kwargs.pop("load_asr", False)
+        asr_model_name = kwargs.pop("asr_model_name", "openai/whisper-large-v3-turbo")
+        quantization = kwargs.pop("quantization", "none")
+
+        if quantization in ("int8", "int4"):
+            from transformers import BitsAndBytesConfig
+
+            if quantization == "int8":
+                kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
+            else:
+                compute_dtype = kwargs.get("dtype", torch.float16)
+                kwargs["quantization_config"] = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_compute_dtype=compute_dtype,
+                    bnb_4bit_quant_type="nf4",
+                    bnb_4bit_use_double_quant=True,
+                )
+
+        # Suppress noisy INFO logs from transformers/huggingface_hub during loading
+        _prev_disable = logging.root.manager.disable
+        logging.disable(logging.INFO)
+
+        try:
+            model = super().from_pretrained(
+                pretrained_model_name_or_path, *args, **kwargs
+            )
+
+            if not train_mode:
+                # Resolve local path for audio tokenizer subdirectory
+                if os.path.isdir(pretrained_model_name_or_path):
+                    resolved_path = pretrained_model_name_or_path
+                else:
+                    from huggingface_hub import snapshot_download
+
+                    resolved_path = snapshot_download(pretrained_model_name_or_path)
+
+                model.text_tokenizer = AutoTokenizer.from_pretrained(
+                    pretrained_model_name_or_path
+                )
+
+                audio_tokenizer_path = os.path.join(resolved_path, "audio_tokenizer")
+
+                if not os.path.isdir(audio_tokenizer_path):
+                    audio_tokenizer_path = "eustlb/higgs-audio-v2-tokenizer"
+
+                tokenizer_device = (
+                    "cpu" if str(model.device).startswith("mps") else model.device
+                )
+                model.audio_tokenizer = HiggsAudioV2TokenizerModel.from_pretrained(
+                    audio_tokenizer_path, device_map=tokenizer_device
+                )
+                model.feature_extractor = AutoFeatureExtractor.from_pretrained(
+                    audio_tokenizer_path
+                )
+
+                model.sampling_rate = model.feature_extractor.sampling_rate
+                model.duration_estimator = RuleDurationEstimator()
+
+                if load_asr:
+                    model.load_asr_model(model_name=asr_model_name)
+        finally:
+            logging.disable(_prev_disable)
+
+        return model
+
     def create_voice_clone_prompt(
         self,
         ref_audio: Union[str, tuple[torch.Tensor, int]],
