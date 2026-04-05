@@ -416,6 +416,29 @@ class OmniVoice(PreTrainedModel):
 
         return model
 
+    def get_input_embeddings(self):
+        return self.llm.get_input_embeddings()
+
+    def set_input_embeddings(self, value):
+        self.llm.set_input_embeddings(value)
+
+    def _prepare_embed_inputs(
+        self, input_ids: torch.Tensor, audio_mask: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Prepares embeddings from input_ids of shape (batch_size, layers, seq_length).
+        Embedding shape is (batch_size, seq_length, hidden_size).
+        """
+        text_embeds = self.get_input_embeddings()(input_ids[:, 0, :])
+
+        shifted_ids = (
+            input_ids * audio_mask.unsqueeze(1)
+        ) + self.codebook_layer_offsets.view(1, -1, 1)
+
+        audio_embeds = self.audio_embeddings(shifted_ids).sum(dim=1)
+
+        return torch.where(audio_mask.unsqueeze(-1), audio_embeds, text_embeds)
+
     def create_voice_clone_prompt(
         self,
         ref_audio: Union[str, tuple[torch.Tensor, int]],
